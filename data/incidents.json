@@ -1,0 +1,320 @@
+[
+  {
+    "id": "INC-1001",
+    "date": "2025-09-04",
+    "service": "orders-svc",
+    "severity": "SEV2",
+    "title": "Order history API p99 latency 8s due to missing composite index",
+    "symptoms": "PagerDuty alert 'orders-svc p99 latency > 2000ms' fired at 09:12 UTC. Mobile app 'My Orders' screen was timing out for roughly 30% of users. RDS Postgres CPU on orders-db-primary sat at 92%.",
+    "error_log": [
+      "2025-09-04T09:14:22.418Z WARN  [http-nio-8080-exec-41] c.a.orders.repo.OrderRepository - Slow query (7842 ms): SELECT * FROM orders WHERE customer_id = $1 ORDER BY created_at DESC LIMIT 20",
+      "2025-09-04T09:14:30.102Z ERROR [http-nio-8080-exec-17] o.a.c.c.C.[.[.[/].[dispatcherServlet] - Servlet.service() threw exception: org.springframework.web.context.request.async.AsyncRequestTimeoutException",
+      "2025-09-04T09:15:01.377Z WARN  [pg-monitor] Seq Scan on orders (cost=0.00..1284467.20 rows=41 width=612) Filter: (customer_id = 88213944)"
+    ],
+    "root_cause": "The orders table had grown to 61M rows after the September back-to-school sale. The only index was the primary key plus a single-column index on customer_id, so the ORDER BY created_at DESC forced the planner into a seq scan and sort for customers with large histories.",
+    "failed_attempts": "1) Scaled orders-svc from 6 to 12 pods, which made things worse by adding more concurrent slow queries against the same DB. 2) Bumped the Postgres instance from db.r6g.2xlarge to db.r6g.4xlarge, which needed a 12 minute failover and did not change query time. 3) Ran VACUUM ANALYZE orders, which had no effect on the plan.",
+    "resolution": "Ran CREATE INDEX CONCURRENTLY idx_orders_customer_created ON orders (customer_id, created_at DESC); which took 14 minutes on the primary. Query time dropped from ~7.8s to 6 ms and p99 returned to 180ms. Also added a Flyway migration V214__add_orders_customer_created_idx.sql so staging and prod stay in sync. Found by Marcus, index applied by Priya.",
+    "time_to_resolve_minutes": 95
+  },
+  {
+    "id": "INC-1002",
+    "date": "2025-09-19",
+    "service": "payments-svc",
+    "severity": "SEV1",
+    "title": "HikariCP pool exhausted from connection leak in refund path",
+    "symptoms": "Checkout success rate fell from 99.4% to 61% within 10 minutes. Alerts fired for 'payments-svc 5xx rate > 5%' and 'hikaricp_connections_pending > 50'. Customers saw 'Payment failed, please try again'. Support tickets spiked.",
+    "error_log": [
+      "2025-09-19T14:03:11.906Z ERROR [http-nio-8443-exec-88] c.z.h.p.HikariPool - payments-pool - Connection is not available, request timed out after 30000ms.",
+      "2025-09-19T14:03:11.907Z ERROR [http-nio-8443-exec-88] c.a.payments.api.ChargeController - org.springframework.jdbc.CannotGetJdbcConnectionException: Failed to obtain JDBC Connection; nested exception is java.sql.SQLTransientConnectionException: payments-pool - Connection is not available, request timed out after 30000ms.",
+      "2025-09-19T14:03:12.140Z WARN  [HikariPool-1 housekeeper] c.z.h.p.PoolBase - payments-pool - Pool stats (total=20, active=20, idle=0, waiting=57)",
+      "\tat com.aurora.payments.refund.RefundService.reverseLedgerEntry(RefundService.java:143)"
+    ],
+    "root_cause": "A refund-path change shipped the previous day (v3.18.0) opened a JDBC Connection manually in RefundService.reverseLedgerEntry() for an idempotency check and did not close it on the early-return branch when a refund was already processed. Every duplicate refund webhook from the card processor leaked one connection. After about 20 duplicates per pod the pool of 20 was gone.",
+    "failed_attempts": "1) Raised HikariCP maximumPoolSize from 20 to 50 via ConfigMap and did a rolling restart. It briefly helped, then the pool filled again and Postgres started rejecting connections at its max_connections=200 limit. 2) Restarted all 8 pods, which bought about 6 minutes each time. 3) Suspected the DB, checked pg_stat_activity, and saw no long queries, only idle connections held by the app.",
+    "resolution": "Enabled spring.datasource.hikari.leak-detection-threshold=15000, which produced a stack trace pointing to RefundService.java:143. Rolled back to v3.17.4 to stop the bleeding (completed 14:41 UTC). Then shipped v3.18.1 wrapping the connection in try-with-resources and setting maximumPoolSize back to 20 with connection-timeout=5000 so failures surface faster. Root cause found by Elena, rollback run by Tomasz.",
+    "time_to_resolve_minutes": 68
+  },
+  {
+    "id": "INC-1003",
+    "date": "2025-10-08",
+    "service": "auth-svc",
+    "severity": "SEV1",
+    "title": "Redis connection pool exhausted, session validation timing out",
+    "symptoms": "Users were randomly logged out and login latency exceeded 10s. Alert 'auth-svc token-introspect p95 > 3s' fired at 18:47 UTC, followed by 5xx from every dependent service. The Redis cluster (sessions-redis-01) looked healthy, with CPU at 14% and memory at 41%.",
+    "error_log": [
+      "2025-10-08T18:47:52.311Z ERROR [reactor-http-epoll-3] c.a.auth.session.SessionStore - Session lookup failed for sid=7f3a...: redis.clients.jedis.exceptions.JedisExhaustedPoolException: Could not get a resource since the pool is exhausted",
+      "Caused by: java.util.NoSuchElementException: Timeout waiting for idle object",
+      "\tat org.apache.commons.pool2.impl.GenericObjectPool.borrowObject(GenericObjectPool.java:507)",
+      "2025-10-08T18:47:53.004Z WARN  [metrics] jedis_pool_active=8 jedis_pool_idle=0 jedis_pool_waiters=212"
+    ],
+    "root_cause": "The Jedis pool was left at the default maxTotal=8 per pod. A traffic spike from a partner SSO integration roughly tripled token introspection calls. In addition, the timeout path in SessionStore.validate() never returned the Jedis resource to the pool when a read timed out, so the pool slowly drained.",
+    "failed_attempts": "1) Restarted the Redis primary via failover, which did nothing since Redis was not the bottleneck. 2) Scaled auth-svc from 4 to 10 pods, which only delayed exhaustion because every pod had the same 8-connection cap and the leak. 3) Increased the Jedis socket timeout from 2000ms to 5000ms, which made requests hang longer and worsened the queueing.",
+    "resolution": "Set jedis.pool.maxTotal=64, maxIdle=32, minIdle=8 and maxWaitMillis=200 (fail fast) in auth-svc-config, and patched SessionStore.validate() to return the resource in a finally block (PR #4471). Also added an alert on jedis_pool_waiters > 20. Diagnosed by Aisha via a thread dump showing 212 threads blocked in borrowObject; patch by Kwame.",
+    "time_to_resolve_minutes": 52
+  },
+  {
+    "id": "INC-1004",
+    "date": "2025-10-27",
+    "service": "search-svc",
+    "severity": "SEV2",
+    "title": "Node.js heap out of memory from unbounded query cache",
+    "symptoms": "search-svc pods were crash-looping every 25-40 minutes. Kubernetes showed 47 restarts in 6 hours. Search was intermittently returning 502s for about 8% of requests, and autocomplete was noticeably degraded during restarts.",
+    "error_log": [
+      "2025-10-27T03:12:44.870Z <--- Last few GCs ---> [1:0x5c3a8e0] 1893204 ms: Mark-sweep 1987.4 (2081.0) -> 1986.9 (2081.5) MB, 812.3 / 0.0 ms (average mu = 0.081, current mu = 0.012) allocation failure; scavenge might not succeed",
+      "2025-10-27T03:12:44.911Z FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory",
+      "2025-10-27T03:12:45.020Z  1: 0xb7a3c0 node::Abort() [node]",
+      "2025-10-27T03:12:46.002Z Back-off restarting failed container search-svc (exit code 134)"
+    ],
+    "root_cause": "A performance optimization added a module-level Map in src/cache/queryResults.js keyed by the full normalized query string plus filters, with no eviction or TTL. Long-tail search queries (millions of unique strings) filled the ~2 GB V8 heap in under an hour.",
+    "failed_attempts": "1) Raised the container memory limit from 2Gi to 4Gi, which only stretched the crash interval from 30 to 55 minutes. 2) Set --max-old-space-size=3072 with no other change, with the same result. 3) Suspected the Elasticsearch client and upgraded @elastic/elasticsearch from 8.9 to 8.15, which had no effect.",
+    "resolution": "Took a heap snapshot with node --heapsnapshot-signal=SIGUSR2 and found 3.1M entries in the queryResults Map. Replaced it with lru-cache (max: 5000, ttl: 300000 ms, maxSize: 64MB) and rolled back the memory limit to 2Gi with --max-old-space-size=1536. Heap has since stayed flat at ~600 MB. Heap analysis by Sofia, fix by Dmitri.",
+    "time_to_resolve_minutes": 150
+  },
+  {
+    "id": "INC-1005",
+    "date": "2025-11-14",
+    "service": "payments-svc",
+    "severity": "SEV1",
+    "title": "Expired mTLS client certificate for acquiring bank gateway",
+    "symptoms": "All card authorizations began failing at 00:00 UTC. Alert 'payments-svc authorization success rate < 50%' fired within 2 minutes. Zero successful captures to the acquirer, while wallet payments still worked.",
+    "error_log": [
+      "2025-11-14T00:00:03.212Z ERROR [auth-worker-12] c.a.payments.acquirer.BankGatewayClient - Handshake failed with acquirer-gw.examplebank.net:8443",
+      "javax.net.ssl.SSLHandshakeException: PKIX path validation failed: java.security.cert.CertPathValidatorException: validity check failed",
+      "Caused by: java.security.cert.CertificateExpiredException: NotAfter: Fri Nov 14 00:00:00 UTC 2025",
+      "\tat sun.security.ssl.Alert.createSSLException(Alert.java:131)"
+    ],
+    "root_cause": "The mTLS client certificate used to authenticate to the acquirer expired at midnight UTC. The renewal reminder went to a former employee's mailbox and the cert was not tracked in the team's cert-expiry monitoring.",
+    "failed_attempts": "1) Restarted payments-svc pods, thinking it was a stale TLS session, which had no effect. 2) Suspected a network issue and checked security groups and the NAT gateway, which were fine. 3) Tried pointing traffic at the acquirer's backup endpoint (:9443), which used the same cert requirement.",
+    "resolution": "Generated a new CSR (openssl req -new -newkey rsa:4096 -nodes -keyout payments-client.key), had the acquirer's ops team sign it on an emergency channel, then updated the Kubernetes secret payments-acquirer-mtls and ran kubectl rollout restart deployment/payments-svc. Authorizations recovered at 01:07 UTC. Follow-ups: added the cert to the cert-manager expiry alerts (30/14/7 days) and moved the renewal contact to payments-oncall@. Coordinated by Rachel, cert installed by Jun.",
+    "time_to_resolve_minutes": 67
+  },
+  {
+    "id": "INC-1006",
+    "date": "2025-12-02",
+    "service": "notifications-svc",
+    "severity": "SEV2",
+    "title": "SQLAlchemy QueuePool exhausted while calling SMS provider",
+    "symptoms": "SMS and push notifications were delayed by 20+ minutes. Alert 'notifications-svc queue age > 600s' fired. Logs were full of pool timeout errors and the worker CPU was near idle, with almost no work being processed.",
+    "error_log": [
+      "2025-12-02T11:26:40,218 ERROR [worker-7] notifications.tasks.send_sms - sqlalchemy.exc.TimeoutError: QueuePool limit of size 5 overflow 10 reached, connection timed out, timeout 30.00 (Background on this error at: https://sqlalche.me/e/14/3o7r)",
+      "  File '/app/notifications/tasks/send_sms.py', line 88, in send_sms",
+      "    with Session() as session:",
+      "2025-12-02T11:26:41,004 WARNING [pool-monitor] checkedout=15 overflow=10/10 waiters=41 host=notif-db.internal:5432"
+    ],
+    "root_cause": "The gunicorn worker count was raised from 4 to 16 the week before while the SQLAlchemy pool stayed at pool_size=5, max_overflow=10 per process. send_sms held its DB session open while making a blocking HTTP call to the SMS vendor, whose latency rose to 8-12s that day. The connections were held for that whole time and the pool drained.",
+    "failed_attempts": "1) Raised pool_size from 5 to 20, which pushed total connections across 16 workers x 6 pods above Postgres max_connections=500 and caused 'FATAL: sorry, too many clients already'. 2) Restarted the Celery workers, which cleared the backlog for only a few minutes. 3) Blamed the vendor and switched to the secondary SMS provider, which fixed nothing since the DB session was the bottleneck.",
+    "resolution": "Refactored send_sms to load the notification record, close the session, call the vendor API, then open a new short session to write the status. Set pool_size=5, max_overflow=5, pool_timeout=5, pool_pre_ping=True and added a 10s timeout on the vendor HTTP client (requests timeout=(3, 10)). Queue drained in 25 minutes. Root cause spotted by Leila in a py-spy dump, fix by Ben.",
+    "time_to_resolve_minutes": 110
+  },
+  {
+    "id": "INC-1007",
+    "date": "2025-12-19",
+    "service": "auth-svc",
+    "severity": "SEV1",
+    "title": "Bad deploy: missing JWT signing key env var rejects all tokens",
+    "symptoms": "Right after the 16:05 UTC deploy of auth-svc v5.2.0, every authenticated API call returned 401. Alert 'global 401 rate > 40%' fired at 16:07. Web and mobile apps showed 'Session expired' for all users.",
+    "error_log": [
+      "2025-12-19T16:06:12.551Z ERROR [main] c.a.auth.jwt.KeyProvider - JWT_SIGNING_KEY_ID not set, falling back to ephemeral key",
+      "2025-12-19T16:06:48.219Z WARN  [http-nio-9000-exec-3] c.a.auth.jwt.TokenVerifier - Signature verification failed: kid=k-2025-11 not found in JWKS (active kid=ephemeral-0a91f3)",
+      "io.jsonwebtoken.security.SignatureException: JWT signature does not match locally computed signature",
+      "\tat io.jsonwebtoken.impl.DefaultJwtParser.parse(DefaultJwtParser.java:398)"
+    ],
+    "root_cause": "The v5.2.0 Helm chart renamed the secret reference from auth-jwt-key to auth-jwt-signing, but the environment variable JWT_SIGNING_KEY_ID in the production values file was not updated. The service booted successfully with a randomly generated ephemeral key instead of failing, so all tokens signed with the real key were rejected.",
+    "failed_attempts": "1) Restarted pods, expecting a race with the secret mount, but the same misconfig persisted. 2) Flushed the token cache in Redis, which had no effect. 3) Assumed a bad JWKS endpoint and purged the CDN cache for /.well-known/jwks.json, which cost 10 minutes and changed nothing.",
+    "resolution": "Ran helm rollback auth-svc 87 at 16:31 UTC, which restored the previous release. Fixed the values-prod.yaml key reference, and made KeyProvider throw on a missing JWT_SIGNING_KEY_ID rather than fall back to an ephemeral key (PR #4602). Redeployed at 17:20 UTC after staging verification. Rollback by Hana, root cause found by Marcus.",
+    "time_to_resolve_minutes": 26
+  },
+  {
+    "id": "INC-1008",
+    "date": "2026-01-13",
+    "service": "notifications-svc",
+    "severity": "SEV2",
+    "title": "RabbitMQ queue backup from email provider 429 retry storm",
+    "symptoms": "Order confirmation emails were delayed by hours. RabbitMQ queue email.send.v2 reached 2.3M messages and the alert 'rabbitmq_queue_messages_ready > 500000' fired at 07:40 UTC. Support saw customers asking about missing receipts.",
+    "error_log": [
+      "2026-01-13T07:38:02.114Z WARN  [email-worker-4] c.a.notif.email.ProviderClient - HTTP 429 from api.mailvendor.io/v3/send: {'errors':[{'message':'Rate limit exceeded: 100 requests/second'}]}",
+      "2026-01-13T07:38:02.115Z INFO  [email-worker-4] c.a.notif.email.RetryPolicy - Retry 3/10 scheduled in 1000ms for message 5d1e-8a...",
+      "2026-01-13T07:41:19.870Z ERROR [rabbit-listener-9] o.s.a.r.l.SimpleMessageListenerContainer - Consumer raised exception, processing can restart if the connection factory supports it. Cause: Rate limited, requeueing",
+      "2026-01-13T07:44:30.002Z WARN  [metrics] email.send.v2 ready=2314877 unacked=4000 publish_rate=1900/s deliver_rate=87/s"
+    ],
+    "root_cause": "A marketing campaign sent 1.8M emails through the transactional queue at the same time as normal traffic. The provider allowed 100 req/s, but 40 workers fired without a shared limiter. The workers then retried 429s immediately with a fixed 1s delay and requeued to the head of the queue, creating a retry storm that starved new messages.",
+    "failed_attempts": "1) Scaled the email workers from 40 to 100, which increased the 429s and made the retries worse. 2) Purged the queue, but stopped after Aisha noticed it would drop order confirmations, so the purge was cancelled. 3) Asked the vendor to raise the limit, but their support could not change it until the next day.",
+    "resolution": "Paused the marketing publisher, then added a Redis-based token bucket limiter (85 req/s, leaving headroom) shared by all workers. Changed retries to exponential backoff with jitter (base 2s, max 120s) and set x-dead-letter-exchange after 6 attempts. Split campaign email into its own queue, email.bulk.v1, with a separate worker pool at 30 req/s. Queue cleared in about 4 hours 20 minutes at the reduced rate. Limiter implemented by Carlos, queue split by Yuki.",
+    "time_to_resolve_minutes": 235
+  },
+  {
+    "id": "INC-1009",
+    "date": "2026-02-03",
+    "service": "orders-svc",
+    "severity": "SEV2",
+    "title": "PgBouncer pool saturated by idle-in-transaction connections",
+    "symptoms": "Order creation errors started at 22:10 UTC. Alert 'pgbouncer cl_waiting > 100' fired, and orders-svc returned 503s with 'no more connections allowed'. Read-only endpoints worked, since they were routed to the replica pool.",
+    "error_log": [
+      "2026-02-03T22:11:07.331Z ERROR [http-nio-8080-exec-52] c.a.orders.service.OrderService - org.postgresql.util.PSQLException: ERROR: no more connections allowed (max_client_conn)",
+      "2026-02-03T22:11:07.902Z WARN  [pgbouncer] pgbouncer[1]: LOG C-0x5581a2: orders/orders_app@10.14.2.61:48212 pooler error: no more connections allowed (max_client_conn)",
+      "2026-02-03T22:12:00.010Z STATS pgbouncer: pool=orders/orders_app cl_active=0 cl_waiting=214 sv_active=0 sv_idle=0 sv_used=0 sv_login=0 maxwait=41",
+      "2026-02-03T22:13:41.440Z pg_stat_activity: 60 sessions state='idle in transaction' age > 00:14:00 application_name=inventory-reconcile"
+    ],
+    "root_cause": "The new nightly inventory-reconcile batch job began a transaction, then made slow calls to the warehouse API before committing, leaving 60 server connections in 'idle in transaction'. With PgBouncer in transaction pooling mode (default_pool_size=60), these connections were pinned, leaving no server connections for regular order traffic.",
+    "failed_attempts": "1) Raised PgBouncer default_pool_size from 60 to 120 and reloaded, but Postgres max_connections=150 left too little headroom, and the batch job simply took the extra slots. 2) Restarted PgBouncer, which dropped in-flight orders and recovered for only 2 minutes. 3) Increased max_client_conn from 1000 to 3000, which does not affect the number of server connections.",
+    "resolution": "Killed the reconcile sessions with SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name='inventory-reconcile' AND state='idle in transaction'; traffic recovered immediately. Then set idle_in_transaction_session_timeout='30s' on the orders_app role, moved the batch job to its own PgBouncer pool (pool_size=10) and rewrote it to commit before each warehouse API call. Found by Olivia, batch fix by Rohan.",
+    "time_to_resolve_minutes": 58
+  },
+  {
+    "id": "INC-1010",
+    "date": "2026-02-24",
+    "service": "search-svc",
+    "severity": "SEV1",
+    "title": "Elasticsearch indices read-only after flood-stage disk watermark",
+    "symptoms": "New and updated products stopped appearing in search from about 05:30 UTC. The indexing pipeline alert 'search-indexer error rate > 20%' fired. Cluster health was yellow and then red for the products-v7 index. Customers reported out-of-stock items still showing as available.",
+    "error_log": [
+      "2026-02-24T05:31:12.802Z ERROR [indexer-3] c.a.search.indexer.BulkWriter - ClusterBlockException: index [products-v7] blocked by: [TOO_MANY_REQUESTS/12/disk usage exceeded flood-stage watermark, index has read-only-allow-delete block];",
+      "[2026-02-24T05:30:58,441][WARN ][o.e.c.r.a.DiskThresholdMonitor] [es-data-2] flood stage disk watermark [95%] exceeded on [Xk9Tq_2vR6e][es-data-2][/var/lib/elasticsearch] free: 41.2gb[4.9%], all indices on this node will be marked read-only",
+      "[2026-02-24T05:32:10,019][WARN ][o.e.c.r.a.AllocationService] [es-master-1] failing shard [products-v7][3] on node es-data-2 due to no space left on device"
+    ],
+    "root_cause": "Data nodes ran at 95% disk because ILM rollover for the search-logs index had been silently disabled after a template change in January, so 11 weeks of query logs (about 700 GB) piled up on the same nodes as the product indices.",
+    "failed_attempts": "1) Removed the read-only block with PUT _all/_settings {'index.blocks.read_only_allow_delete': null}. Elasticsearch re-applied it within 30 seconds because disk was still above 95%. 2) Restarted es-data-2, which triggered shard relocation and pushed the other nodes past the watermark. 3) Raised cluster.routing.allocation.disk.watermark.flood_stage to 97%, which was a bad idea, and it was reverted after Ines pointed out the risk of a full disk.",
+    "resolution": "Deleted the oldest 8 weeks of search-logs-* indices (freeing 520 GB), then cleared the read-only block, and shards recovered in about 20 minutes. Fixed the ILM policy binding (index.lifecycle.name: search-logs-policy, rollover at 50gb/7d, delete at 30d) and added a disk alert at 75% and 85%. Also added 2 data nodes (es-data-4, es-data-5). Cleanup by Ines, ILM fix by Tariq.",
+    "time_to_resolve_minutes": 125
+  },
+  {
+    "id": "INC-1011",
+    "date": "2026-03-11",
+    "service": "orders-svc",
+    "severity": "SEV3",
+    "title": "Kafka consumer lag from rebalance storm on order-events",
+    "symptoms": "Fulfillment status updates lagged by 15-40 minutes. Alert 'kafka_consumergroup_lag > 200000 on orders.events.v1' fired at 13:20 UTC. No customer-facing failures, but the warehouse team reported stale statuses.",
+    "error_log": [
+      "2026-03-11T13:18:44.290Z WARN  [orders-consumer-2] o.a.k.c.c.i.ConsumerCoordinator - [Consumer clientId=orders-consumer-2, groupId=orders-fulfillment] Offset commit failed on partition orders.events.v1-7 at offset 1948820: The coordinator is not aware of this member.",
+      "2026-03-11T13:18:44.291Z ERROR [orders-consumer-2] o.a.k.c.c.i.ConsumerCoordinator - CommitFailedException: Commit cannot be completed since the group has already rebalanced and assigned the partitions to another member. This means that the time between subsequent calls to poll() was longer than the configured max.poll.interval.ms, which typically implies that the poll loop is spending too much time message processing.",
+      "2026-03-11T13:19:02.115Z INFO  [orders-consumer-5] o.a.k.c.c.i.ConsumerCoordinator - (Re-)joining group orders-fulfillment"
+    ],
+    "root_cause": "The fulfillment handler began calling a slow inventory endpoint synchronously (avg 2.1s per message) while max.poll.records was still 500, so a batch took about 17 minutes against max.poll.interval.ms=300000. Consumers were evicted from the group, rebalanced repeatedly and re-read uncommitted messages.",
+    "failed_attempts": "1) Added 6 more consumer pods (12 to 18), which triggered even more rebalances and left 4 pods idle because the topic has 12 partitions. 2) Increased session.timeout.ms from 10000 to 45000, which addresses heartbeats, not poll interval. 3) Restarted the consumer group and reset offsets to latest, which risked skipping events, so it was rolled back.",
+    "resolution": "Set max.poll.records=25 and max.poll.interval.ms=600000, and moved the inventory call to a bounded thread pool (8 threads, 3s timeout) with results awaited before commit. Scaled back to 12 pods and enabled the cooperative-sticky assignor (partition.assignment.strategy=CooperativeStickyAssignor). Lag cleared in about 35 minutes. Diagnosed by Nadia, fix by Owen.",
+    "time_to_resolve_minutes": 80
+  },
+  {
+    "id": "INC-1012",
+    "date": "2026-04-02",
+    "service": "auth-svc",
+    "severity": "SEV2",
+    "title": "Login slowness from seq scan on login_attempts with lower(email) filter",
+    "symptoms": "Login p95 climbed from 250ms to 6.5s over three days, then hit timeouts during the Monday morning peak at 08:45 UTC. Alert 'auth-svc /login p99 > 5s' fired. The DB replica lag also grew to 40s.",
+    "error_log": [
+      "2026-04-02T08:47:15.660Z WARN  [http-nio-9000-exec-29] c.a.auth.repo.LoginAttemptRepo - Slow query (5390 ms): SELECT count(*) FROM login_attempts WHERE lower(email) = $1 AND attempted_at > now() - interval '15 minutes'",
+      "2026-04-02T08:47:16.002Z DEBUG [pg-explain] Aggregate (cost=4218830.11..4218830.12 rows=1 width=8) -> Seq Scan on login_attempts (cost=0.00..4218829.90 rows=85 width=0) Filter: (lower((email)::text) = 'user@example.com'::text)",
+      "2026-04-02T08:47:21.884Z ERROR [http-nio-9000-exec-11] c.a.auth.api.LoginController - java.util.concurrent.TimeoutException: Login throttle check exceeded 5000ms"
+    ],
+    "root_cause": "The brute-force throttle query used lower(email) but the only index was on the raw email column. The login_attempts table had grown to 180M rows because the cleanup cron had been failing silently since a January migration, so each login triggered a full table scan.",
+    "failed_attempts": "1) Added a plain btree index on (email, attempted_at), which the planner ignored because the query wrapped email in lower(). 2) Increased the replica's instance size, which did not change the query plan. 3) Temporarily disabled the throttle check via feature flag, which was rejected by security as a brute-force risk after 10 minutes.",
+    "resolution": "Created CREATE INDEX CONCURRENTLY idx_login_attempts_lower_email_time ON login_attempts (lower(email), attempted_at DESC); and query time fell to 3ms. Also fixed the cleanup CronJob (wrong schema name after the migration), deleted rows older than 30 days in batches of 100k, and partitioned the table by month. Index by Sanjay, cleanup by Grace.",
+    "time_to_resolve_minutes": 105
+  },
+  {
+    "id": "INC-1013",
+    "date": "2026-04-22",
+    "service": "payments-svc",
+    "severity": "SEV2",
+    "title": "Go service memory growth from unclosed HTTP response bodies",
+    "symptoms": "payments-svc pods were being OOMKilled every 3-4 hours. Alerts for 'container_memory_working_set_bytes > 90% of limit' and 'pod restarts > 3 in 1h' fired. Restarts caused a few dozen failed payment webhooks each time.",
+    "error_log": [
+      "2026-04-22T10:52:31.004Z ERROR webhook-forwarder: Post 'https://hooks.merchant-partners.io/v2/payment-events': dial tcp 34.102.88.17:443: socket: too many open files",
+      "2026-04-22T10:55:02.771Z level=warn msg='goroutines=48211 heap_inuse=812MB' component=runtime-stats",
+      "goroutine 9412 [IO wait, 187 minutes]: net/http.(*persistConn).readLoop(0xc0004a2000) /usr/local/go/src/net/http/transport.go:2238",
+      "2026-04-22T10:58:40Z kubelet: Container payments-svc failed liveness probe, OOMKilled (exit code 137), limit=1Gi"
+    ],
+    "root_cause": "A refactor of the merchant webhook forwarder (v4.9.0) dropped the defer resp.Body.Close() when the non-2xx branch returned early. Each failed webhook leaked a goroutine and a TCP connection, and one partner endpoint that returned 502s for hours made it worse. The http.Client also had no Timeout set.",
+    "failed_attempts": "1) Raised the memory limit from 1Gi to 2Gi, which only extended the time between kills to about 7 hours. 2) Set GOGC=50 to be more aggressive with garbage collection, which did nothing since the goroutines were still referenced. 3) Increased the file descriptor ulimit from 1024 to 65536, which delayed the 'too many open files' errors but not the leak.",
+    "resolution": "Captured a goroutine profile with curl localhost:6060/debug/pprof/goroutine?debug=2, which showed 46k goroutines stuck in persistConn.readLoop. Patched the forwarder to always defer resp.Body.Close() and drain with io.Copy(io.Discard, resp.Body), and set http.Client{Timeout: 10 * time.Second} and Transport.MaxIdleConnsPerHost=20. Released as v4.9.2. Memory stays around 220 MB. Profile analysis by Fatima, patch by Lucas.",
+    "time_to_resolve_minutes": 140
+  },
+  {
+    "id": "INC-1014",
+    "date": "2026-05-15",
+    "service": "notifications-svc",
+    "severity": "SEV2",
+    "title": "APNs push certificate expired, iOS notifications silently failing",
+    "symptoms": "The mobile team reported that no iOS users had received push notifications since the previous evening, while Android was fine. There was no alert, and the issue was discovered from a support ticket spike at 09:15 UTC. Push delivery rate to iOS was 0% for 14 hours.",
+    "error_log": [
+      "2026-05-14T19:00:04.338Z ERROR [apns-sender-2] c.a.notif.push.ApnsClient - APNs connection closed by peer: SslHandshakeException: Received fatal alert: certificate_expired",
+      "2026-05-14T19:00:04.340Z WARN  [apns-sender-2] c.a.notif.push.ApnsClient - Push to token=ab41c9... failed, will not retry: ConnectionClosedException",
+      "2026-05-14T19:00:05.001Z ERROR [apns-sender-7] c.a.notif.push.ApnsClient - com.eatthepie.apns.ApnsClientException: Unable to send notification; nested javax.net.ssl.SSLException: Received fatal alert: certificate_expired",
+      "\tat io.netty.handler.ssl.SslHandler.decodeJdkCompatible(SslHandler.java:1273)"
+    ],
+    "root_cause": "The APNs provider certificate (.p12) expired on 2026-05-14 at 18:59 UTC after its yearly validity. The error was logged and swallowed as non-retryable, and there was no metric or alert on the iOS push failure rate.",
+    "failed_attempts": "1) Assumed an Apple outage and checked developer.apple.com/system-status, which showed all green. 2) Restarted notifications-svc pods, which had no effect. 3) Regenerated the device token cache, thinking the tokens were stale, which wasted about 40 minutes.",
+    "resolution": "Generated a new certificate in the Apple Developer portal, exported it as a .p12, and updated the Kubernetes secret apns-provider-cert. Because certificate renewal keeps recurring, switched to token-based auth (.p8 key, Key ID 7XQ2M9K4TB), which does not expire. Added an alert on apns_send_failure_ratio > 5% for 5m. About 1.2M missed notifications were not backfilled by product decision. Cert diagnosis by Amara, migration by Ethan.",
+    "time_to_resolve_minutes": 95
+  },
+  {
+    "id": "INC-1015",
+    "date": "2026-06-09",
+    "service": "search-svc",
+    "severity": "SEV3",
+    "title": "N+1 queries on product_variants making search results slow",
+    "symptoms": "Search result pages were slow (p95 3.8s) for category browse pages with 48+ results. Alert 'search-svc p95 > 2500ms' fired at 15:30 UTC. Postgres product-catalog replica showed 14k queries/sec, almost all of the same shape.",
+    "error_log": [
+      "2026-06-09T15:32:09.114Z DEBUG [query-log] SELECT id, sku, price_cents, stock FROM product_variants WHERE product_id = 20481 (0.9 ms)",
+      "2026-06-09T15:32:09.115Z DEBUG [query-log] SELECT id, sku, price_cents, stock FROM product_variants WHERE product_id = 20482 (0.8 ms)",
+      "2026-06-09T15:32:12.876Z WARN  [http-nio-7070-exec-14] c.a.search.api.SearchController - Request /search?category=shoes&page=1 took 3811ms (queries=97)",
+      "2026-06-09T15:33:01.410Z WARN  [pg-monitor] Seq Scan on product_variants (cost=0.00..96412.00 rows=3 width=48) Filter: (product_id = 20483)"
+    ],
+    "root_cause": "The upgrade to Hibernate 6.4 changed the default fetch strategy for Product.variants from batched to lazy, producing one query per result item. In addition, product_variants had no index on product_id, since it had been relying on the FK constraint, which Postgres does not index automatically.",
+    "failed_attempts": "1) Enabled Redis caching of the search response for 60s, which had a poor hit rate because filters made keys highly diverse. 2) Scaled search-svc pods from 8 to 16, which just increased load on the DB replica. 3) Rolled back Hibernate to 6.2, but this caused a build failure with other dependencies and was abandoned.",
+    "resolution": "Added CREATE INDEX CONCURRENTLY idx_product_variants_product_id ON product_variants (product_id); (query time dropped from ~50ms seq scan to 0.4ms) and annotated Product.variants with @BatchSize(size = 50) plus @EntityGraph on the search repository method. Queries per request dropped from 97 to 3 and p95 fell to 310ms. Found by Diego, fixed by Mei.",
+    "time_to_resolve_minutes": 85
+  },
+  {
+    "id": "INC-1016",
+    "date": "2026-07-01",
+    "service": "payments-svc",
+    "severity": "SEV1",
+    "title": "Deploy migration blocked writes: non-concurrent index build on ledger_entries",
+    "symptoms": "Right after the 11:00 UTC deploy, payment writes hung and checkout failed with timeouts. Alert 'payments-svc 5xx > 10%' fired at 11:04 UTC. The DB showed a large number of sessions waiting on a lock, and the deploy job was still running.",
+    "error_log": [
+      "2026-07-01T11:03:21.005Z ERROR [http-nio-8443-exec-31] c.a.payments.ledger.LedgerWriter - org.postgresql.util.PSQLException: ERROR: canceling statement due to statement timeout",
+      "2026-07-01T11:03:22.417Z INFO  [flyway] Migrating schema 'public' to version 3.41 - add ledger entries merchant index",
+      "2026-07-01T11:04:10.930Z pg_stat_activity: pid=28871 state=active wait_event_type=IO query='CREATE INDEX idx_ledger_merchant_created ON ledger_entries (merchant_id, created_at)' runtime=00:03:02",
+      "2026-07-01T11:04:11.001Z pg_locks: 173 sessions waiting for RowExclusiveLock on ledger_entries, blocked by ShareLock held by pid 28871"
+    ],
+    "root_cause": "The Flyway migration V341 created an index on ledger_entries (about 240M rows) without CONCURRENTLY. This took a ShareLock on the table, blocking every INSERT and UPDATE for the duration of the index build, which was estimated at 25 minutes. Staging had only 2M rows, so the problem never showed up in testing.",
+    "failed_attempts": "1) Scaled up the app pods, which added more blocked connections. 2) Tried to cancel the deploy pipeline in CI, but the migration was already running inside Postgres and continued after the pipeline stopped. 3) Terminated the app's blocked sessions, which was pointless because they immediately reconnected and blocked again.",
+    "resolution": "Ran SELECT pg_cancel_backend(28871); to cancel the index build, and writes resumed within 10 seconds (traffic normalized 11:19 UTC). Then rewrote the migration as CREATE INDEX CONCURRENTLY (with flyway executeInTransaction=false in V341__ledger_merchant_idx.sql) and ran it off-peak at 02:00 UTC. Added a CI check that rejects CREATE INDEX statements without CONCURRENTLY on tables listed as large. Cancelled by Naomi, migration rewrite by Viktor.",
+    "time_to_resolve_minutes": 34
+  },
+  {
+    "id": "INC-1017",
+    "date": "2026-07-22",
+    "service": "auth-svc",
+    "severity": "SEV2",
+    "title": "API gateway rate limit too low, legitimate users getting 429 during promo",
+    "symptoms": "During a flash-sale email campaign starting 12:00 UTC, about 35% of login and token refresh requests returned 429. Alert 'gateway 429 rate > 10%' fired at 12:06. Users saw 'Too many requests, try again later'. Conversion dropped significantly, but back-end services were healthy at 30% CPU.",
+    "error_log": [
+      "2026-07-22T12:06:18.402Z [envoy] 'POST /api/v1/auth/token' 429 - local_rate_limited rate_limit_policy=auth-global remaining=0 limit=100 window=1s",
+      "2026-07-22T12:06:18.403Z [envoy] upstream_rq_429{cluster=auth-svc} 4212 in last 10s",
+      "2026-07-22T12:06:40.911Z WARN  [ratelimit-svc] descriptor key=auth-global exceeded: 100 req/s (observed peak 1480 req/s)"
+    ],
+    "root_cause": "The gateway rate-limit policy auth-global had been set to a flat 100 req/s for all clients when it was introduced for a load test in March, and it was never revisited. The flash sale generated peaks of ~1,480 req/s from many distinct users behind mobile carrier NAT, which all counted against the same global bucket.",
+    "failed_attempts": "1) Scaled auth-svc from 6 to 12 pods, which changed nothing because the traffic was being rejected at the gateway before reaching the pods. 2) Restarted the ratelimit-svc, which reset counters for only about 1 second. 3) Added the campaign's IP range to the allowlist, but traffic came from mobile clients on thousands of carrier IPs.",
+    "resolution": "Changed the rate-limit config from a global 100 req/s to per-user limits keyed on the x-user-id / device-id header (30 req/min per user, 10 req/min for unauthenticated login per IP) with a global ceiling of 3,000 req/s. Applied by editing ratelimit-config.yaml and running kubectl rollout restart deployment/ratelimit-svc; 429s dropped below 0.2% in 4 minutes. Root cause identified by Zara, config by Andre.",
+    "time_to_resolve_minutes": 43
+  },
+  {
+    "id": "INC-1018",
+    "date": "2026-08-18",
+    "service": "orders-svc",
+    "severity": "SEV2",
+    "title": "JVM container OOMKilled from Netty direct buffer leak",
+    "symptoms": "orders-svc pods were restarting about every 2 hours with exit code 137, while the JVM heap dashboards looked normal at roughly 45%. Alert 'container OOMKilled' fired 9 times overnight. Order creation error rate spiked to 3% for around 40 seconds each time a pod died.",
+    "error_log": [
+      "2026-08-18T02:41:07.226Z ERROR [reactor-http-nio-4] i.n.u.ResourceLeakDetector - LEAK: ByteBuf.release() was not called before it's garbage collected. Recent access records: #1: io.netty.buffer.AdvancedLeakAwareByteBuf.getBytes(AdvancedLeakAwareByteBuf.java:1189) com.aurora.orders.client.InventoryGrpcClient.decode(InventoryGrpcClient.java:212)",
+      "2026-08-18T03:12:55.601Z WARN  [reactor-http-nio-2] o.s.w.r.f.c.ExchangeFunctions - java.lang.OutOfMemoryError: Cannot reserve 4194304 bytes of direct buffer memory",
+      "2026-08-18T03:14:20.000Z kubelet: Container orders-svc terminated: OOMKilled (exit code 137), limits.memory=2Gi, jvm -Xmx1536m"
+    ],
+    "root_cause": "The container limit was 2Gi with -Xmx1536m, leaving only about 500 MB for metaspace, thread stacks and native memory. A custom decoder in InventoryGrpcClient retained Netty pooled ByteBufs without releasing them on the error path, leaking off-heap memory of about 80 MB per hour. The kernel OOM killer fired even though the Java heap was healthy.",
+    "failed_attempts": "1) Increased -Xmx from 1536m to 1792m, which made it worse by leaving less headroom for native memory, and the pod died sooner. 2) Took a heap dump and found nothing, since the leak was outside the heap. 3) Restarted with -XX:+UseG1GC tuning (MaxGCPauseMillis=100), which had no relevance to direct memory.",
+    "resolution": "Enabled -Dio.netty.leakDetection.level=advanced and -XX:NativeMemoryTracking=summary, which confirmed the growth in the Internal/Other category. Fixed InventoryGrpcClient.decode() with ReferenceCountUtil.release(buf) in a finally block, and set -Xmx1280m -XX:MaxDirectMemorySize=256m with the container limit at 2Gi. Native memory has stayed flat at ~310 MB since. Investigation by Hiroshi, patch by Chloe.",
+    "time_to_resolve_minutes": 175
+  }
+]
